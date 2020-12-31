@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
 use futures::task::ArcWake;
-use std::collections::BTreeMap;
+use std::cell::RefCell;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::Context;
 use std::task::Waker;
@@ -10,20 +11,15 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::{future::Future, task::Poll};
 
-use futures::{
-    channel::mpsc::{channel, Receiver, Sender},
-    join,
-};
+use futures::join;
 
 struct Task {
     future: Pin<Box<dyn Future<Output = ()> + 'static>>,
-    waked: bool,
 }
 impl Task {
     fn new(f: impl Future<Output = ()> + 'static) -> Self {
         Self {
             future: Box::pin(f),
-            waked: false,
         }
     }
 
@@ -33,69 +29,99 @@ impl Task {
             Poll::Ready(()) => Poll::Ready(()),
         }
     }
-
-    fn wake(&mut self) {
-        self.waked = true;
-    }
 }
 
-type TaskId = usize;
-struct Runtime {
-    frame_counter: usize,
-    task_id_counter: TaskId,
-    tasks_queue: Vec<Task>,
-    wait_tasks: BTreeMap<TaskId, Task>,
-    receiver: Receiver<TaskId>,
-    sender: Sender<TaskId>,
+#[derive(Clone)]
+struct WakeFlag {
+    waked: Arc<Mutex<bool>>,
 }
-impl Runtime {
+impl WakeFlag {
     fn new() -> Self {
-        let (sender, receiver) = channel(10);
-
         Self {
-            frame_counter: 0,
-            task_id_counter: 0,
-            tasks_queue: vec![],
-            wait_tasks: BTreeMap::new(),
-            receiver,
-            sender,
+            waked: Arc::new(Mutex::new(false)),
         }
     }
 
-    fn spawn(&mut self, f: impl Future<Output = ()> + 'static) {
-        self.tasks_queue.push(Task::new(f));
+    fn wake(&self) {
+        *self.waked.lock().unwrap() = true;
     }
 
-    fn run(&mut self) {
+    fn is_waked(&self) -> bool {
+        *self.waked.lock().unwrap()
+    }
+}
+
+#[derive(Clone)]
+struct WakeFlagWaker {
+    flag: WakeFlag,
+}
+impl WakeFlagWaker {
+    fn waker(flag: WakeFlag) -> Waker {
+        futures::task::waker(Arc::new(Self { flag }))
+    }
+}
+impl ArcWake for WakeFlagWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.flag.wake();
+    }
+}
+
+#[derive(Clone)]
+struct Runtime {
+    frame_counter: usize,
+    tasks_queue: Rc<RefCell<Vec<Task>>>,
+    wait_tasks: Rc<RefCell<Vec<Task>>>,
+}
+impl Runtime {
+    fn new() -> Self {
+        Self {
+            frame_counter: 0,
+            tasks_queue: Rc::new(RefCell::new(vec![])),
+            wait_tasks: Rc::new(RefCell::new(vec![])),
+        }
+    }
+
+    fn spawn(&self, f: impl Future<Output = ()> + 'static) {
+        self.tasks_queue.borrow_mut().push(Task::new(f));
+    }
+
+    fn run(&mut self, f: impl Future<Output = ()> + 'static) {
+        self.frame_counter = 0;
+        self.spawn(f);
+
         'update_loop: loop {
             let frame_start = Instant::now();
 
+            println!("Frame count: {}", self.frame_counter);
+
             'current_frame: loop {
-                let task = self.tasks_queue.pop();
+                let task = self.tasks_queue.borrow_mut().pop();
 
                 match task {
                     None => break 'current_frame,
                     Some(mut task) => {
-                        let task_id = self.task_id_counter;
-
-                        let waker = TaskWaker::waker(task_id, self.sender.clone());
+                        let flag = WakeFlag::new();
+                        let waker = WakeFlagWaker::waker(flag.clone());
 
                         match task.poll(Context::from_waker(&waker)) {
                             Poll::Ready(()) => (),
                             Poll::Pending => {
-                                // taskをBTreeに入れる
-                                self.wait_tasks.insert(task_id, task);
-                                self.task_id_counter += 1;
+                                // タスクがwake済みだったらtask_queueにpush
+                                // そうでなかったらwait_tasksにpushする
+                                if flag.is_waked() {
+                                    self.tasks_queue.borrow_mut().push(task);
+                                } else {
+                                    self.wait_tasks.borrow_mut().push(task);
+                                }
                             }
-                        }
-
-                        // 先のpollでwakerが呼ばれていた分のreceiverをチェック
-                        while let Ok(Some(task_id)) = self.receiver.try_next() {
-                            let t = self.wait_tasks.remove(&task_id).unwrap();
-                            self.tasks_queue.push(t);
                         }
                     }
                 }
+            }
+
+            // wait_tasksが空の場合、全てのタスクの実行が終わっている。
+            if self.wait_tasks.borrow().is_empty() {
+                break 'update_loop;
             }
 
             // 1/60待つ
@@ -105,72 +131,24 @@ impl Runtime {
                 sleep(Duration::new(0, 16666666) - duration);
             }
 
+            // 次のフレームに移る前にフレームカウンターを更新する
             self.frame_counter += 1;
 
-            if self.wait_tasks.is_empty() {
-                break 'update_loop;
-            }
-
-            // 1フレーム進んだことをすべてのタスクに通知したい。
-
-            //mspcに溜まっているものを全部洗う。
-            while let Ok(Some(task_id)) = self.receiver.try_next() {
-                let t = self.wait_tasks.remove(&task_id).unwrap();
-                self.tasks_queue.push(t);
-            }
-
-            // // wait_tasksの中からwakedなタスクだけをtasksに入れる。
-            // // let mut i = 0;
-            // // while i == self.wait_tasks.len() {
-            // //     if self.wait_tasks[&i].waked {
-            // //         self.tasks_queue.push(self.wait_tasks.remove(&i).expect(""));
-            // //     } else {
-            // //         i += 1;
-            // //     }
-            // // }
-            // let mut waked_index = vec![];
-            // for (i, t) in self.wait_tasks.iter() {
-            //     if t.waked {
-            //         waked_index.push(i);
-            //     }
-            // }
+            // wait_tasksを空のtasks_queueと交換する
+            std::mem::swap(&mut self.wait_tasks, &mut self.tasks_queue);
         }
     }
 }
 
-#[derive(Clone)]
-struct TaskWaker {
-    task_id: TaskId,
-    sender: Arc<Mutex<Sender<TaskId>>>,
-}
-impl TaskWaker {
-    fn waker(task_id: TaskId, sender: Sender<TaskId>) -> Waker {
-        futures::task::waker(Arc::new(Self {
-            task_id,
-            sender: Arc::new(Mutex::new(sender)),
-        }))
-    }
-}
-impl ArcWake for TaskWaker {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        arc_self
-            .sender
-            .lock()
-            .unwrap()
-            .start_send(arc_self.task_id)
-            .unwrap();
-    }
-}
-
-struct WaitNextFrame {
+struct WaitNextFrameFuture {
     polled: bool,
 }
-impl WaitNextFrame {
+impl WaitNextFrameFuture {
     fn new() -> Self {
         Self { polled: false }
     }
 }
-impl Future for WaitNextFrame {
+impl Future for WaitNextFrameFuture {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -183,22 +161,62 @@ impl Future for WaitNextFrame {
     }
 }
 
+fn wait_next_frame() -> WaitNextFrameFuture {
+    WaitNextFrameFuture::new()
+}
+
 async fn ten_frame_task(id: u8) {
-    for i in 0..10 {
+    for i in 0..9 {
         println!("TaskID: {}, Frame: {}", id, i);
-        WaitNextFrame::new().await;
+        wait_next_frame().await;
     }
+    println!("TaskID: {}, Frame: {}", id, 9);
 }
 
 pub fn main_v3() {
-    let mut rt = Runtime::new();
-    rt.spawn(async {
+    let mut runtime = Runtime::new();
+    let r = runtime.clone();
+
+    println!("---- First test ----");
+
+    runtime.run(async move {
+        r.spawn(async {
+            ten_frame_task(5).await;
+        });
+
         ten_frame_task(0).await;
+        wait_next_frame().await;
+
         ten_frame_task(1).await;
+        wait_next_frame().await;
+
         let t2 = ten_frame_task(2);
         let t3 = ten_frame_task(3);
         join!(t2, t3);
+        wait_next_frame().await;
+
         ten_frame_task(4).await;
     });
-    rt.run();
+
+    assert_eq!(runtime.frame_counter + 1, 40);
+
+    println!("---- Second test ----");
+
+    runtime.run(async {
+        async {
+            println!("Hi!");
+        }
+        .await;
+        async {
+            println!("Hoge");
+        }
+        .await;
+        wait_next_frame().await;
+        async {
+            println!("Fuga");
+        }
+        .await;
+    });
+
+    assert_eq!(runtime.frame_counter, 1);
 }
