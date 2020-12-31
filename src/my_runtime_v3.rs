@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use futures::task::ArcWake;
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -11,7 +10,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::{future::Future, task::Poll};
 
-use futures::join;
+use futures::{join, task::ArcWake};
 
 struct Task {
     future: Pin<Box<dyn Future<Output = ()> + 'static>>,
@@ -218,5 +217,15 @@ pub fn main_v3() {
         .await;
     });
 
-    assert_eq!(runtime.frame_counter, 1);
+    assert_eq!(runtime.frame_counter + 1, 2);
+
+    println!("---- Third test ----");
+
+    runtime.run(async {
+        let x: i32 = async { 21 }.await;
+        let y: i32 = async { 21 }.await;
+        println!("{}", x + y);
+    });
+
+    assert_eq!(runtime.frame_counter + 1, 1);
 }
